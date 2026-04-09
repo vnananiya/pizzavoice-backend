@@ -1,4 +1,3 @@
-require('dotenv').config();
 const express = require('express');
 const { VoiceResponse, MessagingResponse } = require('twilio').twiml;
 const twilio = require('twilio');
