@@ -77,7 +77,7 @@ function generateAIResponse(text, state) {
   // Only greet on true greeting words — NOT "order" (that's handled in ordering stage)
   if (state.stage === 'greeting' && /^hi|hey|hello|start$/i.test(text)) {
     state.stage = 'ordering';
-    state.order = []; state.cartTotal = 0; state.deal = null;
+    state.order = []; state.cartTotal = 0; state.deal = null; state.awaitingConfirm = false;
     return "Hi! Welcome to Domino's. I'm your AI ordering assistant. What can I get started for you today?";
   }
 
@@ -105,9 +105,9 @@ function generateAIResponse(text, state) {
     return `${item.name} added!${dealStr} Anything else or ready to confirm?`;
   }
 
-  if (/confirm|yes|yeah|yep|done|place order|that's all/i.test(text)) {
+  if (/confirm|yes|yeah|yep|done|place order|that's all|i want to order/i.test(text)) {
     if (state.order.length === 0) return "Your order is empty! What would you like?";
-    state.stage = 'confirming';
+    state.awaitingConfirm = true;
     const itemsList = state.order.map(i => `${i.qty > 1 ? i.qty + ' ' : ''}${i.name}`).join(', ');
     return `Order: ${itemsList}. Subtotal: ${fmt(state.cartTotal)}. Say YES to confirm, or add more items.`;
   }
@@ -133,9 +133,9 @@ app.post('/voice', async (req, res) => {
   let state;
   if (callsCollection) {
     const existing = await callsCollection.findOne({ callSid });
-    state = existing?.state || { stage: 'greeting', order: [], cartTotal: 0, deal: null };
+    state = existing?.state || { stage: 'greeting', order: [], cartTotal: 0, deal: null, awaitingConfirm: false };
   } else {
-    state = { stage: 'greeting', order: [], cartTotal: 0, deal: null };
+    state = { stage: 'greeting', order: [], cartTotal: 0, deal: null, awaitingConfirm: false };
   }
 
   let response;
@@ -150,8 +150,8 @@ app.post('/voice', async (req, res) => {
   }
   // Else: Gather timeout with empty speech → no response text, just re-Gather
 
-  // Check for order confirmation
-  if (state.stage === 'confirming' && /yes|yeah|yep|confirm|do it|place/i.test(speechResult)) {
+  // Check for order confirmation (only if awaitingConfirm flag is set — avoids double-processing with generateAIResponse)
+  if (state.awaitingConfirm && /yes|yeah|yep|confirm|do it|place/i.test(speechResult)) {
     const orderNum = generateOrderNumber();
     let total = state.cartTotal;
     if (state.deal) {
@@ -188,7 +188,7 @@ app.post('/voice', async (req, res) => {
 
     response = `Perfect! Order ${orderNum} confirmed! Total: ${fmt(finalTotal)}. You'll get a text receipt shortly. Thanks for calling Domino's!`;
     state.stage = 'confirmed';
-    state.order = []; state.cartTotal = 0;
+    state.order = []; state.cartTotal = 0; state.awaitingConfirm = false;
 
     // Send SMS receipt
     if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
