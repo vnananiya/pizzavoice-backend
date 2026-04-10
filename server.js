@@ -8,310 +8,526 @@ app.use(cors());
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// MongoDB connection
-const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://pizzavoice:PizzaVoice2024!@cluster0.iygqt51.mongodb.net/?appName=Cluster0';
-const DB_NAME = 'pizzavoice';
+// ------------------------------
+// Config
+// ------------------------------
+const MONGO_URI = process.env.MONGO_URI;
+const DB_NAME = process.env.DB_NAME || 'pizzavoice';
+const STORE_NAME = process.env.STORE_NAME || "Domino's";
+const STORE_ADDRESS = process.env.STORE_ADDRESS || '142 Broadway, New York NY 10013';
+const STORE_HOURS = process.env.STORE_HOURS || '10 AM to midnight daily';
+const TAX_RATE = Number(process.env.TAX_RATE || 0.085);
+
+if (!MONGO_URI) {
+  console.warn('⚠️ MONGO_URI is not set. Falling back to in-memory storage.');
+}
+
 let db;
 let ordersCollection;
 let callsCollection;
+let mongoClient;
+let ordersMap = new Map();
+let callsMap = new Map();
 
 async function connectDB() {
+  if (!MONGO_URI) return;
+
   try {
-    const client = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 5000 });
-    await client.connect();
-    db = client.db(DB_NAME);
+    mongoClient = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 5000 });
+    await mongoClient.connect();
+    db = mongoClient.db(DB_NAME);
     ordersCollection = db.collection('orders');
     callsCollection = db.collection('calls');
     console.log('✅ MongoDB connected successfully');
   } catch (err) {
     console.error('❌ MongoDB connection failed:', err.message);
-    // Fall back to in-memory
-    ordersMap = new Map();
-    callsMap = new Map();
+    ordersCollection = null;
+    callsCollection = null;
   }
 }
+
 connectDB();
 
-// ─── MENU & DEALS ───────────────────────────────
+// ------------------------------
+// Menu + deals
+// ------------------------------
 const MENU = {
-  pepperoni:   { name: 'Pepperoni Pizza',              price: 14.99 },
-  margherita:  { name: 'Margherita Pizza',            price: 13.99 },
-  bbq:         { name: 'BBQ Bacon Cheeseburger Pizza', price: 17.99 },
-  buffalo:     { name: 'Buffalo Chicken Pizza',       price: 16.99 },
-  vegan:       { name: 'Vegan Garden Pizza',           price: 15.99 },
-  wings:       { name: 'Buffalo Wings (8pc)',          price: 11.99 },
-  breadsticks: { name: 'Garlic Breadsticks',           price:  6.99 },
-  salad:       { name: 'Caesar Salad',                 price:  7.99 },
-  coke:        { name: 'Coca-Cola 2L',                 price:  3.99 },
-  lemonade:    { name: 'Lemonade',                     price:  3.49 },
-  water:       { name: 'Water Bottle',                 price:  1.99 },
-  dessert:     { name: 'Cinnabon Stuffed Breadsticks',  price:  7.99 },
+  pepperoni: { name: 'Pepperoni Pizza', price: 14.99, synonyms: ['pepperoni'] },
+  margherita: { name: 'Margherita Pizza', price: 13.99, synonyms: ['margherita'] },
+  bbq: { name: 'BBQ Bacon Cheeseburger Pizza', price: 17.99, synonyms: ['bbq', 'barbecue'] },
+  buffalo: { name: 'Buffalo Chicken Pizza', price: 16.99, synonyms: ['buffalo chicken', 'buffalo'] },
+  vegan: { name: 'Vegan Garden Pizza', price: 15.99, synonyms: ['vegan garden', 'vegan'] },
+  wings: { name: 'Buffalo Wings (8pc)', price: 11.99, synonyms: ['wings', 'buffalo wings'] },
+  breadsticks: { name: 'Garlic Breadsticks', price: 6.99, synonyms: ['breadsticks', 'garlic breadsticks'] },
+  salad: { name: 'Caesar Salad', price: 7.99, synonyms: ['salad', 'caesar salad'] },
+  coke: { name: 'Coca-Cola 2L', price: 3.99, synonyms: ['coke', 'coca cola', 'coca-cola'] },
+  lemonade: { name: 'Lemonade', price: 3.49, synonyms: ['lemonade'] },
+  water: { name: 'Water Bottle', price: 1.99, synonyms: ['water', 'water bottle'] },
+  dessert: { name: 'Cinnabon Stuffed Breadsticks', price: 7.99, synonyms: ['dessert', 'cinnabon', 'stuffed breadsticks'] },
 };
 
 const DEALS = {
-  PIZZA50:      { desc: '50% OFF Large Pizza',      type: 'percent', value: 50 },
-  WINGS4:       { desc: 'Buy 4 Wings Get 4 FREE',   type: 'bogo',    value: 50 },
-  FREEDELIVERY: { desc: 'Free Delivery',             type: 'fixed',   value: 4.99 },
-  FIRSTORDER:   { desc: '15% OFF First Order',       type: 'percent', value: 15 },
+  PIZZA50: { code: 'PIZZA50', desc: '50% off one pizza item', type: 'percent', value: 50, appliesTo: 'pizza' },
+  WINGS4: { code: 'WINGS4', desc: 'Buy 4 wings get 4 free', type: 'info', value: 0, appliesTo: 'wings' },
+  FREEDELIVERY: { code: 'FREEDELIVERY', desc: 'Free delivery', type: 'fixed', value: 4.99, appliesTo: 'order' },
+  FIRSTORDER: { code: 'FIRSTORDER', desc: '15% off your first order', type: 'percent', value: 15, appliesTo: 'order' },
 };
 
-function generateOrderNumber() { return '#' + Math.floor(1000 + Math.random() * 9000); }
-function fmt(n) { return '$' + parseFloat(n).toFixed(2); }
+function generateOrderNumber() {
+  return '#' + Math.floor(1000 + Math.random() * 9000);
+}
+
+function fmt(n) {
+  return '$' + Number(n).toFixed(2);
+}
+
+function isPizzaItem(name) {
+  return /pizza/i.test(name);
+}
+
+function createInitialState() {
+  return {
+    stage: 'greeting',
+    order: [],
+    cartTotal: 0,
+    deal: null,
+    customerName: null,
+    lastPrompt: null,
+  };
+}
+
+function recalcCartTotal(order) {
+  return order.reduce((sum, item) => sum + Number(item.lineTotal || 0), 0);
+}
+
+function getStorage(collection, map, keyField) {
+  return {
+    async get(key) {
+      if (collection) {
+        const row = await collection.findOne({ [keyField]: key });
+        return row || null;
+      }
+      return map.get(key) || null;
+    },
+    async set(key, value) {
+      if (collection) {
+        await collection.updateOne(
+          { [keyField]: key },
+          { $set: { ...value, [keyField]: key, updatedAt: new Date() } },
+          { upsert: true }
+        );
+        return;
+      }
+      map.set(key, { ...value, [keyField]: key, updatedAt: new Date() });
+    },
+    async insert(doc) {
+      if (collection) {
+        await collection.insertOne(doc);
+        return;
+      }
+      map.set(doc[keyField], doc);
+    },
+    async list() {
+      if (collection) {
+        return collection.find({}).sort({ createdAt: -1 }).toArray();
+      }
+      return Array.from(map.values()).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    },
+  };
+}
+
+const orderStore = getStorage(ordersCollection, ordersMap, 'id');
+const callStore = getStorage(callsCollection, callsMap, 'callSid');
+
+function normalizeText(text = '') {
+  return text.trim().toLowerCase();
+}
+
+function containsAny(text, phrases) {
+  return phrases.some((phrase) => text.includes(phrase));
+}
+
+function parseQuantity(text) {
+  const match = text.match(/\b(\d{1,2})\b/);
+  return match ? Math.max(1, parseInt(match[1], 10)) : 1;
+}
 
 function parseOrderItem(text) {
-  const qtyMatch = text.match(/(\d+)\s*(x|lat|large|medium|small|pizza|order|piece|pc)?/i);
-  const qty = qtyMatch ? parseInt(qtyMatch[1]) : 1;
-  const lower = text.toLowerCase();
-  for (const [key, item] of Object.entries(MENU)) {
-    if (lower.includes(key)) {
-      return { name: item.name, qty, unitPrice: item.price, lineTotal: item.price * qty };
+  const lower = normalizeText(text);
+  const qty = parseQuantity(lower);
+
+  for (const item of Object.values(MENU)) {
+    if (item.synonyms.some((syn) => lower.includes(syn))) {
+      return {
+        name: item.name,
+        qty,
+        unitPrice: item.price,
+        lineTotal: Number((item.price * qty).toFixed(2)),
+      };
     }
   }
+
   return null;
 }
 
-// ─── AI ORDER TAKER ─────────────────────────────
+function summarizeOrder(order) {
+  if (!order.length) return 'nothing yet';
+  return order
+    .map((i) => `${i.qty > 1 ? `${i.qty} ` : ''}${i.name}`)
+    .join(', ');
+}
+
+function applyDeal(subtotal, order, deal) {
+  if (!deal) {
+    return {
+      subtotal,
+      discount: 0,
+      totalBeforeTax: subtotal,
+      note: null,
+    };
+  }
+
+  let discount = 0;
+  let note = deal.desc;
+
+  if (deal.code === 'PIZZA50') {
+    const pizzaItem = order.find((i) => isPizzaItem(i.name));
+    if (pizzaItem) {
+      discount = Number((pizzaItem.lineTotal * 0.5).toFixed(2));
+    }
+  } else if (deal.code === 'FIRSTORDER') {
+    discount = Number((subtotal * 0.15).toFixed(2));
+  } else if (deal.code === 'FREEDELIVERY') {
+    discount = Number(Math.min(4.99, subtotal).toFixed(2));
+  } else if (deal.code === 'WINGS4') {
+    note = 'WINGS4 noted. Staff can verify wing promo at checkout.';
+  }
+
+  const totalBeforeTax = Math.max(0, Number((subtotal - discount).toFixed(2)));
+
+  return {
+    subtotal,
+    discount,
+    totalBeforeTax,
+    note,
+  };
+}
+
+function getMenuSpeech() {
+  return Object.values(MENU)
+    .map((i) => `${i.name} for ${fmt(i.price)}`)
+    .join('. ');
+}
+
+function getDealsSpeech() {
+  return Object.values(DEALS)
+    .map((d) => `${d.code}: ${d.desc}`)
+    .join('. ');
+}
+
 function generateAIResponse(text, state) {
-  const lower = text.toLowerCase();
+  const lower = normalizeText(text);
 
-  // Only greet on true greeting words — NOT "order" (that's handled in ordering stage)
-  if (state.stage === 'greeting' && /^hi|hey|hello|start$/i.test(text)) {
+  if (!lower) {
+    return "Sorry, I didn't catch that. You can say something like pepperoni pizza, wings, or menu.";
+  }
+
+  if (state.stage === 'greeting' && /^(hi|hey|hello|start|good morning|good afternoon|good evening)\b/i.test(text.trim())) {
     state.stage = 'ordering';
-    state.order = []; state.cartTotal = 0; state.deal = null; state.awaitingConfirm = false;
-    return "Hi! Welcome to Domino's. I'm your AI ordering assistant. What can I get started for you today?";
+    return `Hi there. Welcome to ${STORE_NAME}. What can I get started for you today?`;
   }
 
-  if (/menu|what do you have|what's on|what do you serve/i.test(text)) {
-    const items = Object.values(MENU).map(i => `${i.name} at ${fmt(i.price)}`).join('. ');
-    return `Here's our menu: ${items}. What would you like?`;
+  if (containsAny(lower, ['menu', 'what do you have', "what's on", 'what do you serve'])) {
+    state.stage = 'ordering';
+    return `Sure, here are a few favorites. ${getMenuSpeech()}. What sounds good?`;
   }
 
-  if (/deal|discount|special/i.test(text)) {
-    return `Deals: PIZZA50 (50% off pizza), WINGS4 (BOGO wings), FREEDELIVERY, FIRSTORDER (15% off). Say the code when ready!`;
+  if (containsAny(lower, ['deal', 'discount', 'special', 'coupon', 'promo'])) {
+    return `Right now we have these deals: ${getDealsSpeech()}. Just say the code if you want me to apply one.`;
   }
 
-  for (const [code, deal] of Object.entries(DEALS)) {
-    if (lower.includes(code.toLowerCase())) {
+  for (const deal of Object.values(DEALS)) {
+    if (lower.includes(deal.code.toLowerCase())) {
       state.deal = deal;
-      return `Deal applied! ${deal.desc}. Anything else?`;
+      return `Got it. I applied ${deal.code}. ${deal.desc}. What else would you like?`;
     }
   }
 
-  const item = parseOrderItem(text);
+  if (containsAny(lower, ['cancel', 'never mind', 'nevermind', 'stop', 'start over'])) {
+    state.stage = 'ordering';
+    state.order = [];
+    state.cartTotal = 0;
+    state.deal = null;
+    return 'No problem. I cleared the order. What would you like instead?';
+  }
+
+  if (containsAny(lower, ['hours', 'open', 'close'])) {
+    return `We're open ${STORE_HOURS}.`;
+  }
+
+  if (containsAny(lower, ['address', 'where are you', 'location'])) {
+    return `We're located at ${STORE_ADDRESS}.`;
+  }
+
+  if (containsAny(lower, ['price', 'cost', 'how much'])) {
+    return 'Our pizzas start at $13.99, specialty pizzas run up to $17.99, and sides start at $1.99. What would you like?';
+  }
+
+  const item = parseOrderItem(lower);
   if (item) {
+    state.stage = 'ordering';
     state.order.push(item);
-    state.cartTotal += item.lineTotal;
-    const dealStr = state.deal ? ` (${state.deal.desc} applied)` : '';
-    return `${item.name} added!${dealStr} Anything else or ready to confirm?`;
+    state.cartTotal = recalcCartTotal(state.order);
+    return `Perfect. I added ${item.qty > 1 ? `${item.qty} ` : ''}${item.name}. Your subtotal is ${fmt(state.cartTotal)}. Anything else?`;
   }
 
-  if (/confirm|yes|yeah|yep|done|place order|that's all|i want to order/i.test(text)) {
-    if (state.order.length === 0) return "Your order is empty! What would you like?";
-    state.awaitingConfirm = true;
-    const itemsList = state.order.map(i => `${i.qty > 1 ? i.qty + ' ' : ''}${i.name}`).join(', ');
-    return `Order: ${itemsList}. Subtotal: ${fmt(state.cartTotal)}. Say YES to confirm, or add more items.`;
+  if (containsAny(lower, ['confirm', 'that is all', "that's all", 'done', 'place order', 'checkout'])) {
+    if (!state.order.length) {
+      return "Your cart is empty right now. You can say something like one pepperoni pizza and wings.";
+    }
+
+    state.stage = 'confirming';
+    const pricing = applyDeal(state.cartTotal, state.order, state.deal);
+    const tax = Number((pricing.totalBeforeTax * TAX_RATE).toFixed(2));
+    const total = Number((pricing.totalBeforeTax + tax).toFixed(2));
+    const discountText = pricing.discount > 0 ? ` After discount, you're at ${fmt(pricing.totalBeforeTax)} before tax.` : '';
+
+    return `Okay, I have ${summarizeOrder(state.order)}. Subtotal is ${fmt(state.cartTotal)}.${discountText} Estimated total with tax is ${fmt(total)}. Say yes to place it, or tell me what you'd like to change.`;
   }
 
-  if (/cancel|nevermind|stop/i.test(text)) {
-    state.order = []; state.cartTotal = 0;
-    return "Order cancelled. Call us back anytime!";
+  if (state.stage === 'confirming' && containsAny(lower, ['add', 'change', 'remove'])) {
+    state.stage = 'ordering';
+    return 'Sure, let’s update it. Tell me what you want to add or change.';
   }
 
-  if (/price|cost|how much/i.test(text)) return "Pizzas start at $13.99. Specialty $16.99-$17.99. Sides from $1.99. What would you like?";
-  if (/hour|open|close|when|address|where/i.test(text)) return "We're at 142 Broadway, New York NY 10013. Open 10AM-midnight daily!";
-
-  return "I didn't catch that. Say what you'd like to order, or ask for our menu.";
+  return "I want to make sure I get that right. You can say menu, ask for deals, or tell me the item you'd like to order.";
 }
 
-// ─── VOICE WEBHOOK ──────────────────────────────
+async function getCallState(callSid) {
+  try {
+    const existing = await callStore.get(callSid);
+    return existing?.state || createInitialState();
+  } catch (err) {
+    console.error('State read error:', err.message);
+    return createInitialState();
+  }
+}
+
+async function saveCallState(callSid, state) {
+  try {
+    await callStore.set(callSid, { state, callSid, updatedAt: new Date() });
+  } catch (err) {
+    console.error('State save error:', err.message);
+  }
+}
+
+function buildVoiceResponse(message, gatherPrompt = 'Go ahead.') {
+  const twiml = new VoiceResponse();
+
+  if (message) {
+    twiml.say({ voice: 'alice' }, message);
+  }
+
+  const gather = twiml.gather({
+    input: 'speech',
+    action: '/voice',
+    method: 'POST',
+    language: 'en-US',
+    speechTimeout: 'auto',
+    timeout: 5,
+  });
+  gather.say({ voice: 'alice' }, gatherPrompt);
+
+  return twiml;
+}
+
+// ------------------------------
+// Voice webhook
+// ------------------------------
 app.post('/voice', async (req, res) => {
-  const callSid = req.body.CallSid || 'demo-' + Date.now();
+  const callSid = req.body.CallSid || `demo-${Date.now()}`;
   const speechResult = req.body.SpeechResult || '';
   const callerPhone = req.body.From || 'Unknown';
 
-  // Get or create call session
-  let state;
-  if (callsCollection) {
-    const existing = await callsCollection.findOne({ callSid });
-    state = existing?.state || { stage: 'greeting', order: [], cartTotal: 0, deal: null, awaitingConfirm: false };
-  } else {
-    state = { stage: 'greeting', order: [], cartTotal: 0, deal: null, awaitingConfirm: false };
-  }
+  const state = await getCallState(callSid);
+  let responseText = '';
 
-  let response;
+  const normalizedSpeech = normalizeText(speechResult);
 
-  // FIRST entry — always greet and transition to ordering
-  if (state.stage === 'greeting' && !speechResult.trim()) {
-    response = "Hi! Welcome to Domino's. I'm your AI ordering assistant. What can I get started for you today?";
+  if (state.stage === 'greeting' && !normalizedSpeech) {
     state.stage = 'ordering';
-  } else if (speechResult.trim()) {
-    // Active speech input — process it
-    response = generateAIResponse(speechResult, state);
-  }
-  // Else: Gather timeout with empty speech → no response text, just re-Gather
-
-  // Check for order confirmation (only if awaitingConfirm flag is set — avoids double-processing with generateAIResponse)
-  if (state.awaitingConfirm && /yes|yeah|yep|confirm|do it|place/i.test(speechResult)) {
+    responseText = `Hi there. Thanks for calling ${STORE_NAME}. I can help you place an order, hear the menu, or apply a deal. What would you like today?`;
+  } else if (state.stage === 'confirming' && containsAny(normalizedSpeech, ['yes', 'yeah', 'yep', 'confirm', 'place it', 'do it'])) {
+    const pricing = applyDeal(state.cartTotal, state.order, state.deal);
+    const tax = Number((pricing.totalBeforeTax * TAX_RATE).toFixed(2));
+    const finalTotal = Number((pricing.totalBeforeTax + tax).toFixed(2));
     const orderNum = generateOrderNumber();
-    let total = state.cartTotal;
-    if (state.deal) {
-      if (state.deal.type === 'percent') total = total * (1 - state.deal.value / 100);
-      else if (state.deal.type === 'fixed') total = total - state.deal.value;
-    }
-    const tax = total * 0.085;
-    const finalTotal = total + tax;
-    const taxRate = 0.085;
 
     const order = {
-      id: 'ord-' + Date.now(),
+      id: `ord-${Date.now()}`,
       orderNumber: orderNum,
       customerPhone: callerPhone,
       items: state.order,
-      subtotal: state.cartTotal,
-      tax: +(state.cartTotal * taxRate).toFixed(2),
+      subtotal: Number(state.cartTotal.toFixed(2)),
+      discount: pricing.discount,
+      tax,
       total: finalTotal,
       deal: state.deal?.desc || null,
       status: 'received',
       callSid,
-      createdAt: new Date().toISOString(),
+      createdAt: new Date(),
     };
 
-    // Save to MongoDB
-    if (ordersCollection) {
+    try {
+      await orderStore.insert(order);
+      console.log('✅ Order saved:', order.orderNumber);
+    } catch (err) {
+      console.error('Order save error:', err.message);
+    }
+
+    responseText = `Perfect. Your order ${orderNum} is confirmed. Your total is ${fmt(finalTotal)}. You’ll get a text receipt shortly. Thanks for calling ${STORE_NAME}.`;
+
+    if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_PHONE_NUMBER && callerPhone !== 'Unknown') {
       try {
-        await ordersCollection.insertOne(order);
-        console.log('✅ Order saved to MongoDB:', order.orderNumber);
+        const twilio = require('twilio');
+        const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+        const itemList = order.items.map((i) => `${i.qty > 1 ? `${i.qty}x ` : ''}${i.name}`).join(', ');
+        await client.messages.create({
+          body: `${STORE_NAME} order ${orderNum} confirmed. Items: ${itemList}. Subtotal: ${fmt(order.subtotal)}. Discount: ${fmt(order.discount)}. Tax: ${fmt(order.tax)}. Total: ${fmt(order.total)}. Estimated wait: 25 to 35 minutes.`,
+          from: process.env.TWILIO_PHONE_NUMBER,
+          to: callerPhone,
+        });
       } catch (err) {
-        console.error('MongoDB insert error:', err.message);
+        console.error('SMS error:', err.message);
       }
     }
 
-    response = `Perfect! Order ${orderNum} confirmed! Total: ${fmt(finalTotal)}. You'll get a text receipt shortly. Thanks for calling Domino's!`;
     state.stage = 'confirmed';
-    state.order = []; state.cartTotal = 0; state.awaitingConfirm = false;
-
-    // Send SMS receipt
-    if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-      const twilio = require('twilio');
-      const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-      const itemList = order.items.map(i => `${i.qty > 1 ? i.qty + 'x ' : ''}${i.name}`).join(', ');
-      client.messages.create({
-        body: `🍕 Domino's Order ${orderNum} Confirmed!\n\n${itemList}\n\nSubtotal: ${fmt(order.subtotal)}\nTax: ${fmt(order.tax)}\nTotal: ${fmt(order.total)}\n\nEst. wait: 25-35 min\nThank you!`,
-        from: process.env.TWILIO_PHONE_NUMBER,
-        to: callerPhone,
-      }).catch(err => console.log('SMS error:', err.message));
-    }
-  }
-
-  // Save call session state
-  if (callsCollection) {
-    try {
-      await callsCollection.updateOne(
-        { callSid },
-        { $set: { callSid, state, updatedAt: new Date().toISOString() } },
-        { upsert: true }
-      );
-    } catch (err) {
-      console.error('calls upsert error:', err.message);
-    }
-  }
-
-  const twiml = new VoiceResponse();
-  twiml.say({ voice: 'alice', bargeIn: true }, response);
-
-  if (state.stage !== 'confirmed') {
-    const g = twiml.gather({
-      input: 'speech', action: '/voice', method: 'POST',
-      language: 'en-US', bargeIn: true, timeout: 6,
-    });
-    g.say({ voice: 'alice' }, 'Go ahead.');
+    state.order = [];
+    state.cartTotal = 0;
+    state.deal = null;
+  } else if (normalizedSpeech) {
+    responseText = generateAIResponse(speechResult, state);
   } else {
-    twiml.say({ voice: 'alice' }, 'Goodbye!');
+    responseText = "Sorry, I didn't hear anything. You can tell me your order whenever you're ready.";
+  }
+
+  await saveCallState(callSid, state);
+
+  let twiml;
+  if (state.stage === 'confirmed') {
+    twiml = new VoiceResponse();
+    twiml.say({ voice: 'alice' }, responseText);
+    twiml.say({ voice: 'alice' }, 'Goodbye.');
+  } else {
+    twiml = buildVoiceResponse(responseText);
   }
 
   res.type('text/xml').send(twiml.toString());
 });
 
-// ─── SMS WEBHOOK ────────────────────────────────
+// ------------------------------
+// SMS webhook
+// ------------------------------
 app.post('/sms', (req, res) => {
   const twiml = new MessagingResponse();
-  twiml.message(`Thanks for texting Domino's! Call ${process.env.TWILIO_PHONE_NUMBER} to order. Open 10AM-midnight daily!`);
+  twiml.message(`Thanks for texting ${STORE_NAME}. To place an order, call ${process.env.TWILIO_PHONE_NUMBER || 'our store number'}. We're open ${STORE_HOURS}.`);
   res.type('text/xml').send(twiml.toString());
 });
 
-// ─── REST API ───────────────────────────────────
+// ------------------------------
+// REST API
+// ------------------------------
 app.get('/api/orders', async (req, res) => {
-  if (ordersCollection) {
-    try {
-      const allOrders = await ordersCollection.find({}).sort({ createdAt: -1 }).toArray();
-      return res.json(allOrders);
-    } catch (err) {
-      console.error('API orders error:', err.message);
-    }
+  try {
+    const allOrders = await orderStore.list();
+    res.json(allOrders);
+  } catch (err) {
+    console.error('API orders error:', err.message);
+    res.status(500).json({ error: 'Unable to fetch orders' });
   }
-  res.json([]);
 });
 
 app.get('/api/orders/:id', async (req, res) => {
-  if (ordersCollection) {
-    try {
-      const order = await ordersCollection.findOne({ id: req.params.id });
-      if (!order) return res.status(404).json({ error: 'Not found' });
-      return res.json(order);
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
-    }
+  try {
+    const orders = await orderStore.list();
+    const order = orders.find((o) => o.id === req.params.id);
+    if (!order) return res.status(404).json({ error: 'Not found' });
+    res.json(order);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-  res.status(500).json({ error: 'DB not connected' });
 });
 
 app.patch('/api/orders/:id/status', async (req, res) => {
-  if (ordersCollection) {
-    try {
-      const result = await ordersCollection.findOneAndUpdate(
-        { id: req.params.id },
-        { $set: { status: req.body.status, updatedAt: new Date().toISOString() } },
-        { returnDocument: 'after' }
-      );
-      if (!result) return res.status(404).json({ error: 'Not found' });
-      return res.json(result);
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
+  try {
+    if (!ordersCollection) {
+      const order = ordersMap.get(req.params.id);
+      if (!order) return res.status(404).json({ error: 'Not found' });
+      order.status = req.body.status;
+      order.updatedAt = new Date();
+      ordersMap.set(req.params.id, order);
+      return res.json(order);
     }
+
+    const result = await ordersCollection.findOneAndUpdate(
+      { id: req.params.id },
+      { $set: { status: req.body.status, updatedAt: new Date() } },
+      { returnDocument: 'after' }
+    );
+
+    if (!result || !result.value) return res.status(404).json({ error: 'Not found' });
+    res.json(result.value);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-  res.status(500).json({ error: 'DB not connected' });
 });
 
 app.get('/api/stats', async (req, res) => {
-  const today = new Date().toDateString();
-  if (ordersCollection) {
-    try {
-      const todayOrders = await ordersCollection.find({
-        createdAt: { $regex: today }
-      }).toArray();
-      const revenue = todayOrders.reduce((s, o) => s + (o.total || 0), 0);
-      return res.json({
-        ordersToday: todayOrders.length,
-        revenueToday: revenue,
-        avgOrder: todayOrders.length > 0 ? revenue / todayOrders.length : 0,
-      });
-    } catch (err) {
-      return res.json({ ordersToday: 0, revenueToday: 0, avgOrder: 0 });
-    }
+  try {
+    const allOrders = await orderStore.list();
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+
+    const todayOrders = allOrders.filter((order) => {
+      const createdAt = new Date(order.createdAt);
+      return createdAt >= startOfToday && createdAt < endOfToday;
+    });
+
+    const revenue = todayOrders.reduce((sum, o) => sum + Number(o.total || 0), 0);
+
+    res.json({
+      ordersToday: todayOrders.length,
+      revenueToday: Number(revenue.toFixed(2)),
+      avgOrder: todayOrders.length ? Number((revenue / todayOrders.length).toFixed(2)) : 0,
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Unable to calculate stats' });
   }
-  res.json({ ordersToday: 0, revenueToday: 0, avgOrder: 0 });
 });
 
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'PizzaVoice AI',
-    mongodb: ordersCollection ? 'connected' : 'not connected',
-    time: new Date().toISOString()
+    mongodb: ordersCollection ? 'connected' : 'in-memory fallback',
+    time: new Date().toISOString(),
   });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🍕 PizzaVoice AI running on port ${PORT}`);
+});
+
+process.on('SIGINT', async () => {
+  try {
+    if (mongoClient) {
+      await mongoClient.close();
+      console.log('MongoDB connection closed');
+    }
+  } finally {
+    process.exit(0);
+  }
 });
